@@ -1,0 +1,370 @@
+const fs = require('fs');
+const path = require('path');
+const OpenAI = require('openai');
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const UserModel = require('../models/user.model.js');
+const NoteModel = require('../models/note.model.js');
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const DEFAULT_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+const buildNotePrompt = ({ user, studyMode, inputType, content }) => {
+  return `You are a smart note assistant. Generate a concise, high-quality study note from the provided content.\n\n` +
+    `Student profile:\n` +
+    `- Name: ${user.name}\n` +
+    `- Goal: ${user.goal || 'general learning'}\n` +
+    `- Style: ${user.style || 'balanced'}\n` +
+    `- Pace: ${user.pace || 'normal'}\n\n` +
+    `Source type: ${inputType}\n` +
+    `Study mode: ${studyMode}\n\n` +
+    `Content:\n${content}\n\n` +
+    `Produce a well-structured note with a short title, key takeaways, and clearly labeled sections. Use bullets and headings where appropriate.`;
+};
+
+const parseOpenAIResponse = (response) => {
+  if (!response) return '';
+  if (response.output_text) return response.output_text;
+  if (response.choices && response.choices[0] && response.choices[0].message) {
+    return response.choices[0].message.content || '';
+  }
+  return '';
+};
+
+const cleanupTempFile = (filePath) => {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (err) {
+    console.warn('Unable to delete temporary file:', filePath, err.message);
+  }
+};
+
+const extractDocumentText = async (filePath) => {
+  const extension = path.extname(filePath).toLowerCase();
+  const rawBuffer = fs.readFileSync(filePath);
+
+  if (extension === '.pdf') {
+    const data = await pdfParse(rawBuffer);
+    return data.text.trim();
+  }
+
+  if (extension === '.docx') {
+    const result = await mammoth.extractRawText({ buffer: rawBuffer });
+    return result.value.trim();
+  }
+
+  return rawBuffer.toString('utf-8').trim();
+};
+
+const generateSmartNote = async ({ user, studyMode, inputType, content }) => {
+  const prompt = buildNotePrompt({ user, studyMode, inputType, content });
+
+  if (!process.env.OPENAI_API_KEY) {
+    return `Smart note placeholder for ${inputType}: ${content.slice(0, 800)}\n\n(Enable OPENAI_API_KEY to generate full notes.)`;
+  }
+
+  const response = await openai.chat.completions.create({
+    model: DEFAULT_MODEL,
+    messages: [
+      { role: 'system', content: 'You are a note generator that turns raw content into structured study notes.' },
+      { role: 'user', content: prompt },
+    ],
+    max_tokens: 1500,
+    temperature: 0.2,
+  });
+
+  return parseOpenAIResponse(response) || `Smart note placeholder for ${inputType}.`;
+};
+
+const normalizeTitle = (content, fallback) => {
+  return content
+    .split('\n')
+    .find((line) => line.trim())
+    ?.replace(/[#*📌]/g, '')
+    .trim() || fallback;
+};
+
+const createNoteRecord = async ({ userId, title, content, studyMode, inputType, transcript }) => {
+  const note = new NoteModel({
+    title,
+    content,
+    owner: userId,
+    mode: [studyMode],
+    inputType,
+    sourceRef: true,
+    transcript: transcript || '',
+    wordCount: content.split(/\s+/).filter(Boolean).length,
+  });
+
+  return await note.save();
+};
+
+const generateFromText = async (req, res) => {
+  const { studyMode, text } = req.body;
+  const userId = req.user.id;
+
+  if (!studyMode || !text) {
+    return res.status(400).json({ error: 'studyMode and text are required.' });
+  }
+
+  const user = await UserModel.findById(userId);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  try {
+    const noteContent = await generateSmartNote({
+      user,
+      studyMode,
+      inputType: 'text',
+      content: text,
+    });
+
+    const title = normalizeTitle(noteContent, 'Smart Note');
+    const note = await createNoteRecord({
+      userId,
+      title,
+      content: noteContent,
+      studyMode,
+      inputType: 'text',
+    });
+
+    return res.status(201).json({ note });
+  } catch (err) {
+    console.error('Text note error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to generate note from text.' });
+  }
+};
+
+const generateFromDoc = async (req, res) => {
+  const { studyMode } = req.body;
+  const userId = req.user.id;
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded.' });
+  }
+
+  if (!studyMode) {
+    cleanupTempFile(req.file.path);
+    return res.status(400).json({ error: 'studyMode is required.' });
+  }
+
+  const user = await UserModel.findById(userId);
+  if (!user) {
+    cleanupTempFile(req.file.path);
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  try {
+    const rawText = await extractDocumentText(req.file.path);
+    cleanupTempFile(req.file.path);
+
+    const noteContent = await generateSmartNote({
+      user,
+      studyMode,
+      inputType: 'document',
+      content: rawText.slice(0, 15000),
+    });
+
+    const title = normalizeTitle(noteContent, 'Document Note');
+    const note = await createNoteRecord({
+      userId,
+      title,
+      content: noteContent,
+      studyMode,
+      inputType: 'document',
+    });
+
+    return res.status(201).json({ note });
+  } catch (err) {
+    cleanupTempFile(req.file.path);
+    console.error('Document note error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to generate note from document.' });
+  }
+};
+
+const generateFromAudio = async (req, res) => {
+  const { studyMode } = req.body;
+  const userId = req.user.id;
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'No audio file uploaded.' });
+  }
+
+  if (!studyMode) {
+    cleanupTempFile(req.file.path);
+    return res.status(400).json({ error: 'studyMode is required.' });
+  }
+
+  const user = await UserModel.findById(userId);
+  if (!user) {
+    cleanupTempFile(req.file.path);
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  try {
+    let transcript = '';
+
+    if (process.env.OPENAI_API_KEY) {
+      const audioStream = fs.createReadStream(req.file.path);
+      const transcription = await openai.audio.transcriptions.create({
+        file: audioStream,
+        model: 'whisper-1',
+      });
+      transcript = transcription.text || transcription;
+    } else {
+      transcript = 'Transcription is unavailable. Set OPENAI_API_KEY to enable audio transcription.';
+    }
+
+    cleanupTempFile(req.file.path);
+
+    const noteContent = await generateSmartNote({
+      user,
+      studyMode,
+      inputType: 'audio',
+      content: transcript,
+    });
+
+    const title = normalizeTitle(noteContent, 'Audio Note');
+    const note = await createNoteRecord({
+      userId,
+      title,
+      content: noteContent,
+      studyMode,
+      inputType: 'audio',
+      transcript,
+    });
+
+    return res.status(201).json({ note, transcript });
+  } catch (err) {
+    cleanupTempFile(req.file.path);
+    console.error('Audio note error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to generate note from audio.' });
+  }
+};
+
+const generateFromLink = async (req, res) => {
+  const { studyMode, url } = req.body;
+  const userId = req.user.id;
+
+  if (!studyMode || !url) {
+    return res.status(400).json({ error: 'studyMode and url are required.' });
+  }
+
+  const user = await UserModel.findById(userId);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  try {
+    const isYoutube = /youtube\.com\/watch|youtu\.be\//.test(url);
+    let extractedText = '';
+
+    if (isYoutube) {
+      const { YoutubeTranscript } = await import('youtube-transcript');
+      const segments = await YoutubeTranscript.fetchTranscript(url);
+      extractedText = segments.map((segment) => segment.text).join(' ');
+    } else {
+      const pageRes = await fetch(url);
+      const html = await pageRes.text();
+      extractedText = html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 15000);
+    }
+
+    if (!extractedText || extractedText.length < 50) {
+      return res.status(422).json({ error: 'Could not extract enough content from that link.' });
+    }
+
+    const noteContent = await generateSmartNote({
+      user,
+      studyMode,
+      inputType: isYoutube ? 'YouTube transcript' : 'web page',
+      content: extractedText,
+    });
+
+    const title = normalizeTitle(noteContent, 'Link Note');
+    const note = await createNoteRecord({
+      userId,
+      title,
+      content: noteContent,
+      studyMode,
+      inputType: 'link',
+    });
+
+    return res.status(201).json({ note, extractedText });
+  } catch (err) {
+    console.error('Link note error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to extract content from the provided link.' });
+  }
+};
+
+const getAllUserNotes = async (req, res) => {
+  const { userId } = req.params;
+
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Access denied.' });
+  }
+
+  try {
+    const notes = await NoteModel.find({ owner: userId }).sort({ createdAt: -1 });
+    return res.json({ notes });
+  } catch (err) {
+    console.error('Get notes error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to load notes.' });
+  }
+};
+
+const getSingleUserNote = async (req, res) => {
+  const { userId, noteId } = req.params;
+
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Access denied.' });
+  }
+
+  try {
+    const note = await NoteModel.findOne({ _id: noteId, owner: userId });
+    if (!note) {
+      return res.status(404).json({ error: 'Note not found.' });
+    }
+    return res.json({ note });
+  } catch (err) {
+    console.error('Get note error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to load note.' });
+  }
+};
+
+const deleteNote = async (req, res) => {
+  const { userId, noteId } = req.params;
+
+  if (req.user.id !== userId) {
+    return res.status(403).json({ error: 'Access denied.' });
+  }
+
+  try {
+    const result = await NoteModel.deleteOne({ _id: noteId, owner: userId });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Note not found.' });
+    }
+    return res.json({ message: 'Note deleted successfully.' });
+  } catch (err) {
+    console.error('Delete note error:', err.message || err);
+    return res.status(500).json({ error: 'Failed to delete note.' });
+  }
+};
+
+module.exports = {
+  generateFromText,
+  generateFromDoc,
+  generateFromAudio,
+  generateFromLink,
+  getAllUserNotes,
+  getSingleUserNote,
+  deleteNote,
+};
