@@ -111,7 +111,6 @@ POST /api/user/sign-up
 
 ```json
 {
-  "name": "Jane Doe",
   "email": "jane@example.com",
   "password": "yourpassword"
 }
@@ -122,7 +121,7 @@ POST /api/user/sign-up
 ```json
 {
   "message": "...",
-  "user": { "id": "...", "name": "...", "email": "..." },
+  "user": { "id": "...", "email": "..." },
   "token": "..."
 }
 ```
